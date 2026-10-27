@@ -436,6 +436,214 @@ jobs:
 
               private fun addBlank() {
                   val i = selected
-                  edit(i + 1) { d ->
+                                    edit(i + 1) { d ->
                       val box = d.getPage(i).cropBox
-                      d.pages.insertAfter(PDPage(
+                      d.pages.insertAfter(PDPage(PDRectangle(box.width, box.height)), d.getPage(i))
+                  }
+              }
+
+              private fun addImage(uri: Uri) {
+                  if (!hasDoc()) return
+                  edit(ratios.size) { d ->
+                      val bmp = loadBitmap(uri)
+                      val pw = 595f
+                      val ph = pw * bmp.height / bmp.width
+                      val page = PDPage(PDRectangle(pw, ph))
+                      d.addPage(page)
+                      val img = JPEGFactory.createFromImage(d, bmp, 0.9f)
+                      PDPageContentStream(d, page).use { it.drawImage(img, 0f, 0f, pw, ph) }
+                      bmp.recycle()
+                  }
+              }
+
+              private fun loadBitmap(uri: Uri): Bitmap {
+                  val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it, null, o) }
+                  var s = 1
+                  while (maxOf(o.outWidth, o.outHeight) / s > 2200) s *= 2
+                  val o2 = BitmapFactory.Options().apply { inSampleSize = s }
+                  val src = contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it, null, o2) }
+                      ?: error("Can't read that image")
+                  val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+                  Canvas(out).apply { drawColor(Color.WHITE); drawBitmap(src, 0f, 0f, null) }
+                  src.recycle()
+                  return out
+              }
+
+              private fun rotate() {
+                  val i = selected
+                  edit { d ->
+                      val p = d.getPage(i)
+                      p.rotation = (p.rotation + 90) % 360
+                  }
+              }
+
+              private fun deletePage() {
+                  if (ratios.size <= 1) { toast("A PDF needs at least one page"); return }
+                  val i = selected
+                  edit(minOf(i, ratios.size - 2)) { d -> d.removePage(i) }
+              }
+
+              private fun move(dir: Int) {
+                  val i = selected
+                  val j = i + dir
+                  if (j < 0 || j >= ratios.size) return
+                  edit(j) { d ->
+                      val l = d.pages.toMutableList()
+                      java.util.Collections.swap(l, i, j)
+                      while (d.numberOfPages > 0) d.removePage(0)
+                      l.forEach { d.addPage(it) }
+                  }
+              }
+
+              private fun undo() {
+                  if (!prevFile.exists()) { toast("Nothing to undo"); return }
+                  io.execute {
+                      try {
+                          prevFile.copyTo(workFile, true)
+                          prevFile.delete()
+                          reload()
+                      } catch (e: Throwable) { fail(e) }
+                  }
+              }
+
+              private fun saveAs() {
+                  if (!hasDoc()) return
+                  startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE)
+                      type = "application/pdf"
+                      putExtra(Intent.EXTRA_TITLE, docName.removeSuffix(".pdf") + "-edited.pdf")
+                  }, SAVE)
+              }
+
+              private fun savePdf(uri: Uri) {
+                  io.execute {
+                      try {
+                          contentResolver.openOutputStream(uri, "wt")!!.use { o -> workFile.inputStream().use { it.copyTo(o) } }
+                          toast("Saved")
+                      } catch (e: Throwable) { fail(e) }
+                  }
+              }
+
+              // ---------- annotate (draw / text) ----------
+              private fun openEditor() {
+                  if (!hasDoc()) return
+                  val idx = selected
+                  io.execute {
+                      try {
+                          val r = renderer ?: return@execute
+                          val w = resources.displayMetrics.widthPixels
+                          r.openPage(idx).use { p ->
+                              val bmp = Bitmap.createBitmap(w, (w * p.height.toFloat() / p.width).toInt(), Bitmap.Config.ARGB_8888)
+                              bmp.eraseColor(Color.WHITE)
+                              p.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                              val pts = p.width.toFloat()
+                              ui.post { showEditor(idx, bmp, pts) }
+                          }
+                      } catch (e: Throwable) { fail(e) }
+                  }
+              }
+
+              private fun showEditor(idx: Int, bmp: Bitmap, pts: Float) {
+                  val dlg = Dialog(this, android.R.style.Theme_DeviceDefault_Light_NoActionBar)
+                  val v = AnnotView(this, bmp, pts)
+                  val colors = intArrayOf(Color.RED, Color.BLUE, Color.BLACK, Color.rgb(0, 150, 0))
+                  val names = arrayOf("Red", "Blue", "Black", "Green")
+                  var ci = 0
+                  val bar = LinearLayout(this)
+                  fun add(t: String, a: (Button) -> Unit) {
+                      bar.addView(Button(this).apply {
+                          text = t; isAllCaps = false; textSize = 13f
+                          setOnClickListener { a(this) }
+                      })
+                  }
+                  add("Mode: Draw") { b -> v.drawMode = !v.drawMode; b.text = if (v.drawMode) "Mode: Draw" else "Mode: Text (tap page)" }
+                  add("Color: Red") { b -> ci = (ci + 1) % 4; v.color = colors[ci]; b.text = "Color: ${names[ci]}" }
+                  add("Undo") { v.items.removeLastOrNull(); v.invalidate() }
+                  add("Cancel") { dlg.dismiss() }
+                  add("Done") {
+                      dlg.dismiss()
+                      val items = v.items.toList()
+                      if (items.isNotEmpty()) edit { d -> applyAnnotations(d, idx, items) }
+                  }
+                  v.onTap = { fx, fy ->
+                      val input = EditText(this).apply { hint = "Text"; setSingleLine() }
+                      AlertDialog.Builder(this).setTitle("Add text").setView(input)
+                          .setPositiveButton("Add") { _, _ ->
+                              val t = input.text.toString().trim()
+                              if (t.isNotEmpty()) { v.items.add(Note(fx, fy, t, v.color)); v.invalidate() }
+                          }
+                          .setNegativeButton("Cancel", null).show()
+                  }
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.LTGRAY)
+                  }
+                  root.addView(HorizontalScrollView(this).apply { addView(bar) })
+                  root.addView(ScrollView(this).apply { addView(v) }, LinearLayout.LayoutParams(-1, 0, 1f))
+                  dlg.setContentView(root)
+                  dlg.show()
+                  dlg.window?.setLayout(-1, -1)
+              }
+
+              /** Writes the strokes/text onto the real PDF page (vector, keeps the original content). */
+              private fun applyAnnotations(d: PDDocument, idx: Int, items: List<Any>) {
+                  val pg = d.getPage(idx)
+                  val box = pg.cropBox
+                  val pw = box.width
+                  val ph = box.height
+                  val rot = ((pg.rotation % 360) + 360) % 360
+                  fun map(fx: Float, fy: Float): FloatArray {
+                      val m = when (rot) {
+                          90 -> floatArrayOf(fy * pw, fx * ph)
+                          180 -> floatArrayOf(pw - fx * pw, fy * ph)
+                          270 -> floatArrayOf(pw - fy * pw, ph - fx * ph)
+                          else -> floatArrayOf(fx * pw, (1 - fy) * ph)
+                      }
+                      m[0] += box.lowerLeftX
+                      m[1] += box.lowerLeftY
+                      return m
+                  }
+                  PDPageContentStream(d, pg, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
+                      for (item in items) {
+                          if (item is Stroke) {
+                              cs.setStrokingColor(Color.red(item.color), Color.green(item.color), Color.blue(item.color))
+                              cs.setLineWidth(2f)
+                              cs.setLineCapStyle(1)
+                              cs.setLineJoinStyle(1)
+                              item.pts.forEachIndexed { i, q ->
+                                  val m = map(q.x, q.y)
+                                  if (i == 0) cs.moveTo(m[0], m[1]) else cs.lineTo(m[0], m[1])
+                              }
+                              if (item.pts.size == 1) {
+                                  val m = map(item.pts[0].x, item.pts[0].y)
+                                  cs.lineTo(m[0] + 0.1f, m[1])
+                              }
+                              cs.stroke()
+                          } else if (item is Note) {
+                              val m = map(item.x, item.y)
+                              val safe = item.text.map { c -> if (c.code in 32..126 || c.code in 160..255) c else '?' }.joinToString("")
+                              cs.beginText()
+                              cs.setFont(PDType1Font.HELVETICA, 14f)
+                              cs.setNonStrokingColor(Color.red(item.color), Color.green(item.color), Color.blue(item.color))
+                              cs.setTextMatrix(Matrix.getRotateInstance(Math.toRadians(rot.toDouble()), m[0], m[1]))
+                              cs.showText(safe)
+                              cs.endText()
+                          }
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+      - name: Build debug APK
+        working-directory: PdfEdit
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PdfEdit-APK
+          path: PdfEdit/app/build/outputs/apk/debug/app-debug.apk
+                      
+
+
+
+
