@@ -1,0 +1,441 @@
+name: Build PdfEdit APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Generate project files
+        run: |
+          mkdir -p "PdfEdit/"
+          cat > "PdfEdit/settings.gradle.kts" <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PdfEdit"
+          include(":app")
+          EOF_FILE
+          mkdir -p "PdfEdit/"
+          cat > "PdfEdit/build.gradle.kts" <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p "PdfEdit/"
+          cat > "PdfEdit/gradle.properties" <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p "PdfEdit/app"
+          cat > "PdfEdit/app/build.gradle.kts" <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.pdfedit.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.pdfedit.app"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              packaging {
+                  resources.excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*")
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.recyclerview:recyclerview:1.3.2")
+              implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+          }
+          EOF_FILE
+          mkdir -p "PdfEdit/app/src/main"
+          cat > "PdfEdit/app/src/main/AndroidManifest.xml" <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p "PdfEdit/app/src/main/res/values"
+          cat > "PdfEdit/app/src/main/res/values/strings.xml" <<'EOF_FILE'
+          <resources>
+              <string name="app_name">PDF Editor</string>
+          </resources>
+          EOF_FILE
+          mkdir -p "PdfEdit/app/src/main/java/com/pdfedit/app"
+          cat > "PdfEdit/app/src/main/java/com/pdfedit/app/MainActivity.kt" <<'EOF_FILE'
+          package com.pdfedit.app
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.Dialog
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.*
+          import android.graphics.pdf.PdfRenderer
+          import android.net.Uri
+          import android.os.*
+          import android.provider.OpenableColumns
+          import android.view.*
+          import android.widget.*
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+          import com.tom_roush.pdfbox.io.MemoryUsageSetting
+          import com.tom_roush.pdfbox.multipdf.PDFMergerUtility
+          import com.tom_roush.pdfbox.pdmodel.PDDocument
+          import com.tom_roush.pdfbox.pdmodel.PDPage
+          import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
+          import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
+          import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
+          import com.tom_roush.pdfbox.pdmodel.graphics.image.JPEGFactory
+          import com.tom_roush.pdfbox.util.Matrix
+          import java.io.File
+          import java.util.concurrent.Executors
+
+          private const val OPEN = 1
+          private const val ADD_PDF = 2
+          private const val ADD_IMG = 3
+          private const val SAVE = 4
+
+          class Stroke(val pts: MutableList<PointF>, val color: Int)
+          class Note(val x: Float, val y: Float, val text: String, val color: Int)
+
+          /** Shows one page; lets the user draw or tap to place text. Positions are stored as 0..1 fractions. */
+          class AnnotView(ctx: Context, private val bmp: Bitmap, private val pageW: Float) : View(ctx) {
+              val items = mutableListOf<Any>()
+              var drawMode = true
+              var color = Color.RED
+              var onTap: ((Float, Float) -> Unit)? = null
+              private var cur: Stroke? = null
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onMeasure(w: Int, h: Int) {
+                  val width = MeasureSpec.getSize(w)
+                  setMeasuredDimension(width, width * bmp.height / bmp.width)
+              }
+
+              override fun onDraw(c: Canvas) {
+                  c.drawBitmap(bmp, null, Rect(0, 0, width, height), null)
+                  val s = width / pageW
+                  for (item in items) {
+                      if (item is Stroke) {
+                          paint.color = item.color
+                          paint.style = Paint.Style.STROKE
+                          paint.strokeWidth = 2f * s
+                          paint.strokeCap = Paint.Cap.ROUND
+                          paint.strokeJoin = Paint.Join.ROUND
+                          val p = Path()
+                          item.pts.forEachIndexed { i, q ->
+                              if (i == 0) p.moveTo(q.x * width, q.y * height) else p.lineTo(q.x * width, q.y * height)
+                          }
+                          if (item.pts.size == 1) p.lineTo(item.pts[0].x * width + 0.1f, item.pts[0].y * height)
+                          c.drawPath(p, paint)
+                      } else if (item is Note) {
+                          paint.color = item.color
+                          paint.style = Paint.Style.FILL
+                          paint.textSize = 14f * s
+                          c.drawText(item.text, item.x * width, item.y * height, paint)
+                      }
+                  }
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val fx = (e.x / width).coerceIn(0f, 1f)
+                  val fy = (e.y / height).coerceIn(0f, 1f)
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          parent?.requestDisallowInterceptTouchEvent(drawMode)
+                          if (drawMode) {
+                              val s = Stroke(mutableListOf(PointF(fx, fy)), color)
+                              cur = s
+                              items.add(s)
+                              invalidate()
+                          }
+                      }
+                      MotionEvent.ACTION_MOVE -> if (drawMode) {
+                          cur?.pts?.add(PointF(fx, fy))
+                          invalidate()
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          if (!drawMode) onTap?.invoke(fx, fy)
+                          cur = null
+                      }
+                  }
+                  return true
+              }
+          }
+
+          class MainActivity : Activity() {
+
+              private val io = Executors.newSingleThreadExecutor()
+              private val ui = Handler(Looper.getMainLooper())
+              private lateinit var workFile: File
+              private lateinit var prevFile: File
+              private lateinit var tmpFile: File
+              private var renderer: PdfRenderer? = null
+              private var pfd: ParcelFileDescriptor? = null
+              private var ratios: List<Float> = emptyList()
+              @Volatile private var selected = 0
+              private var docName = "document.pdf"
+              private lateinit var status: TextView
+              private lateinit var pages: RecyclerView
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private val imgW: Int get() = resources.displayMetrics.widthPixels - dp(32)
+
+              inner class VH(val box: LinearLayout, val img: ImageView, val label: TextView) : RecyclerView.ViewHolder(box)
+
+              private val pagesAdapter = object : RecyclerView.Adapter<VH>() {
+                  override fun getItemCount() = ratios.size
+
+                  override fun onCreateViewHolder(p: ViewGroup, t: Int): VH {
+                      val box = LinearLayout(this@MainActivity).apply {
+                          orientation = LinearLayout.VERTICAL
+                          gravity = Gravity.CENTER_HORIZONTAL
+                          setPadding(dp(8), dp(8), dp(8), dp(8))
+                          layoutParams = RecyclerView.LayoutParams(-1, -2)
+                      }
+                      val img = ImageView(this@MainActivity).apply { setBackgroundColor(Color.WHITE) }
+                      val label = TextView(this@MainActivity).apply { gravity = Gravity.CENTER }
+                      box.addView(img)
+                      box.addView(label)
+                      val h = VH(box, img, label)
+                      box.setOnClickListener { select(h.bindingAdapterPosition) }
+                      return h
+                  }
+
+                  override fun onBindViewHolder(h: VH, pos: Int) {
+                      val w = imgW
+                      val hgt = (w * ratios[pos]).toInt().coerceAtLeast(1)
+                      h.img.layoutParams = LinearLayout.LayoutParams(w, hgt)
+                      h.img.setImageDrawable(null)
+                      h.img.tag = pos
+                      h.label.text = "${pos + 1} / ${ratios.size}"
+                      h.box.setBackgroundColor(if (pos == selected) 0x551E88E5 else 0)
+                      io.execute {
+                          val r = renderer ?: return@execute
+                          if (pos >= r.pageCount) return@execute
+                          val bmp = Bitmap.createBitmap(w, hgt, Bitmap.Config.ARGB_8888)
+                          bmp.eraseColor(Color.WHITE)
+                          r.openPage(pos).use { it.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY) }
+                          ui.post { if (h.img.tag == pos) h.img.setImageBitmap(bmp) }
+                      }
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  PDFBoxResourceLoader.init(applicationContext)
+                  workFile = File(filesDir, "work.pdf")
+                  prevFile = File(filesDir, "prev.pdf")
+                  tmpFile = File(filesDir, "tmp.pdf")
+
+                  val bar = LinearLayout(this)
+                  fun add(t: String, a: () -> Unit) {
+                      bar.addView(Button(this).apply {
+                          text = t; isAllCaps = false; textSize = 13f
+                          setOnClickListener { a() }
+                      })
+                  }
+                  add("Open") { pick(OPEN, "application/pdf") }
+                  add("New") { newDoc() }
+                  add("Add PDF") { pick(ADD_PDF, "application/pdf") }
+                  add("+ Image") { if (hasDoc()) pick(ADD_IMG, "image/*") }
+                  add("+ Blank") { if (hasDoc()) addBlank() }
+                  add("Annotate") { openEditor() }
+                  add("Rotate") { if (hasDoc()) rotate() }
+                  add("Up") { if (hasDoc()) move(-1) }
+                  add("Down") { if (hasDoc()) move(1) }
+                  add("Delete") { if (hasDoc()) deletePage() }
+                  add("Undo") { undo() }
+                  add("Save as") { saveAs() }
+
+                  pages = RecyclerView(this).apply {
+                      layoutManager = LinearLayoutManager(this@MainActivity)
+                      adapter = pagesAdapter
+                  }
+                  status = TextView(this).apply {
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                      text = "Tap Open to choose a PDF, or New for a blank one."
+                  }
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(0xFFEEEEEE.toInt())
+                  }
+                  root.addView(HorizontalScrollView(this).apply { addView(bar) })
+                  root.addView(pages, LinearLayout.LayoutParams(-1, 0, 1f))
+                  root.addView(status)
+                  setContentView(root)
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  renderer?.close(); pfd?.close()
+              }
+
+              // ---------- helpers ----------
+              private fun toast(s: String) { ui.post { Toast.makeText(this, s, Toast.LENGTH_LONG).show() } }
+              private fun fail(e: Throwable) { toast("Error: ${e.message ?: e.javaClass.simpleName}") }
+              private fun hasDoc(): Boolean {
+                  if (renderer == null) { toast("Open or create a PDF first"); return false }
+                  return true
+              }
+
+              private fun pick(code: Int, mime: String) {
+                  startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE); type = mime
+                  }, code)
+              }
+
+              private fun nameOf(uri: Uri): String? = try {
+                  contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      if (c.moveToFirst()) c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) else null
+                  }
+              } catch (e: Exception) { null }
+
+              private fun copy(uri: Uri, to: File) {
+                  contentResolver.openInputStream(uri)!!.use { i -> to.outputStream().use { o -> i.copyTo(o) } }
+              }
+
+              private fun select(pos: Int) {
+                  if (pos < 0 || pos >= ratios.size) return
+                  val old = selected
+                  selected = pos
+                  (pages.findViewHolderForAdapterPosition(old) as? VH)?.box?.setBackgroundColor(0)
+                  (pages.findViewHolderForAdapterPosition(pos) as? VH)?.box?.setBackgroundColor(0x551E88E5)
+                  updateStatus()
+              }
+
+              private fun updateStatus() {
+                  status.text = if (ratios.isEmpty()) "No document" else "$docName  ·  page ${selected + 1} of ${ratios.size}"
+              }
+
+              /** Re-open the working file for display. Call from the io thread. */
+              private fun reload() {
+                  renderer?.close(); pfd?.close()
+                  val p = ParcelFileDescriptor.open(workFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                  val r = PdfRenderer(p)
+                  val list = ArrayList<Float>()
+                  for (i in 0 until r.pageCount) r.openPage(i).use { list.add(it.height.toFloat() / it.width) }
+                  pfd = p; renderer = r
+                  ui.post {
+                      ratios = list
+                      selected = selected.coerceIn(0, maxOf(0, list.size - 1))
+                      pagesAdapter.notifyDataSetChanged()
+                      updateStatus()
+                  }
+              }
+
+              /** Load working PDF, change it, save it, refresh. One level of undo is kept. */
+              private fun edit(newSel: Int? = null, block: (PDDocument) -> Unit) {
+                  io.execute {
+                      try {
+                          workFile.copyTo(prevFile, true)
+                          PDDocument.load(workFile).use { d -> block(d); d.save(tmpFile) }
+                          tmpFile.renameTo(workFile)
+                          if (newSel != null) selected = newSel
+                          reload()
+                      } catch (e: Throwable) { fail(e) }
+                  }
+              }
+
+              // ---------- document actions ----------
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  val uri = data?.data
+                  if (res != RESULT_OK || uri == null) return
+                  when (req) {
+                      OPEN -> openPdf(uri)
+                      ADD_PDF -> addPdf(uri)
+                      ADD_IMG -> addImage(uri)
+                      SAVE -> savePdf(uri)
+                  }
+              }
+
+              private fun openPdf(uri: Uri) {
+                  val name = nameOf(uri) ?: "document.pdf"
+                  io.execute {
+                      try {
+                          copy(uri, tmpFile)
+                          PDDocument.load(tmpFile).use { if (it.numberOfPages == 0) error("This PDF has no pages") }
+                          tmpFile.renameTo(workFile)
+                          prevFile.delete()
+                          docName = name
+                          selected = 0
+                          reload()
+                      } catch (e: Throwable) { fail(e) }
+                  }
+              }
+
+              private fun newDoc() {
+                  io.execute {
+                      try {
+                          PDDocument().use { d -> d.addPage(PDPage(PDRectangle.A4)); d.save(tmpFile) }
+                          tmpFile.renameTo(workFile)
+                          prevFile.delete()
+                          docName = "new.pdf"
+                          selected = 0
+                          reload()
+                      } catch (e: Throwable) { fail(e) }
+                  }
+              }
+
+              private fun addPdf(uri: Uri) {
+                  if (renderer == null) { openPdf(uri); return }
+                  io.execute {
+                      try {
+                          val inc = File(cacheDir, "incoming.pdf")
+                          copy(uri, inc)
+                          workFile.copyTo(prevFile, true)
+                          val m = PDFMergerUtility()
+                          m.addSource(workFile)
+                          m.addSource(inc)
+                          m.destinationFileName = tmpFile.absolutePath
+                          m.mergeDocuments(MemoryUsageSetting.setupMainMemoryOnly())
+                          tmpFile.renameTo(workFile)
+                          selected = ratios.size
+                          reload()
+                      } catch (e: Throwable) { fail(e) }
+                  }
+              }
+
+              private fun addBlank() {
+                  val i = selected
+                  edit(i + 1) { d ->
+                      val box = d.getPage(i).cropBox
+                      d.pages.insertAfter(PDPage(
